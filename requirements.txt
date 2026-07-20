@@ -1,0 +1,8 @@
+torch
+torchvision
+opencv-python
+ultralytics
+numpy
+PySide6
+Pillow
+timm
