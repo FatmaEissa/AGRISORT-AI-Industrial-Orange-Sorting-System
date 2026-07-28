@@ -228,9 +228,7 @@ The graphical interface provides:
 
 ## Hardware Prototype
 
-<p align="center">
-<img src="assets/screenshots/prototype_1.jpeg" width="800">
-</p>
+
 
 <p align="center">
 <img src="assets/screenshots/prototype_2.jpeg" width="800">
