@@ -1,13 +1,11 @@
 # Classification Model
 
-The trained ConvNeXt classification model is not included in this repository due to GitHub's file size limitations.
+The classification model is downloaded automatically on the first run.
 
-Download the model from:
+**Model file:**
+- `best_orange_model.pth`
 
-https://drive.google.com/drive/folders/1ODbc4zcqpj5C9BlxO_-GaQB8R0ajXYn-
+**Hugging Face Repository:**
+https://huggingface.co/FatmaEissa1/AgriSort-orange-classifier
 
-After downloading, place the file here:
-
-```
-models/classification/best_orange_model.pth
-```
+If the model is missing, the application will download it automatically and save it in this directory.

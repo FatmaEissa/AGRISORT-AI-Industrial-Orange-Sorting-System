@@ -48,7 +48,7 @@ from config import (
     IMAGENET_MEAN, IMAGENET_STD,
 )
 
-
+from utils.download_models import download_models
 # ==========================================================================
 # CLASSIFICATION MODEL (UNCHANGED)
 # ==========================================================================
@@ -183,14 +183,15 @@ class VideoProcessorWorker:
         # ==========================
         # MAIN PIPELINE (UNCHANGED LOGIC)
         # ==========================
+        classification_model_path, detection_model_path = download_models()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._emit({"type": "device", "value": "GPU (CUDA)" if device.type == "cuda" else "CPU"})
 
         self._emit({"type": "status", "value": "Loading YOLO model..."})
-        model_yolo = load_detection_model(YOLO_MODEL_PATH)
+        model_yolo = load_detection_model(detection_model_path)
 
         self._emit({"type": "status", "value": "Loading classification model..."})
-        model_class = load_classification_model(CLASSIFICATION_MODEL_PATH, device)
+        model_class = load_classification_model(classification_model_path, device)
 
         video_path = self.video_path
         cap = cv2.VideoCapture(video_path)

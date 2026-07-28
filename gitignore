@@ -1,14 +1,29 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
+# Virtual Environment
 .venv/
 venv/
 
-models/detection/*.pt
-models/classification/*.pth
-
+# Streamlit Secrets
 .streamlit/secrets.toml
 
+# macOS
 .DS_Store
+
+# Windows
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# Environment Variables
+.env
+models/classification/*.pth
+models/detection/*.pt
