@@ -1,12 +1,14 @@
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
 .venv/
 venv/
 
-*.pth
-*.pt
+models/detection/*.pt
+models/classification/*.pth
 
-.ipynb_checkpoints/
+.streamlit/secrets.toml
 
 .DS_Store

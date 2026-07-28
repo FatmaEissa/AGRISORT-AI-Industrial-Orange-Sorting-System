@@ -1,7 +1,13 @@
 # Classification Model
 
-The trained classification model is not included in this repository due to GitHub file size limitations.
+The trained ConvNeXt classification model is not included in this repository due to GitHub's file size limitations.
 
-Download it from Google Drive:
+Download the model from:
 
-https://drive.google.com/drive/folders/1ODbc4zcqpj5C9BlxO_-GaQB8R0ajXYn-?usp=sharing
+https://drive.google.com/drive/folders/1ODbc4zcqpj5C9BlxO_-GaQB8R0ajXYn-
+
+After downloading, place the file here:
+
+```
+models/classification/best_orange_model.pth
+```

@@ -1,31 +1,37 @@
 """
-processing.py
-==============
+backend/inference.py
+=====================
 This module contains the ORIGINAL AI pipeline logic (YOLO detection,
 ByteTrack tracking, ConvNeXt classification, and the final grade decision
-algorithm - V4) exactly as provided, fully validated and untouched.
+algorithm - V4), carried over unchanged from processing.py.
 
-The ONLY changes made to connect it to the PySide6 GUI were:
-    - Removed cv2.imshow() / cv2.waitKey() (a live preview window can't be
-      used from a background thread - frames are now emitted as Qt signals
-      instead so the GUI can display them)
-    - Removed the hardcoded video path (now supplied by the GUI's file
-      picker) - model paths are unchanged and simply moved to constants
-      at the top of the file
-    - Wrapped the pipeline inside a QThread with a stop flag and Qt
-      signals for frames / counters / FPS / status, since a GUI needs an
-      event-driven way to receive this data instead of printing to console
-    - Made saving the output video file optional (tied to the "Save
-      Output" button in the GUI) instead of always on
+MIGRATION NOTE
+--------------
+Streamlit has no event loop and no signal/slot system, so the PySide6
+`VideoProcessorThread(QThread)` wrapper cannot run as-is. The swap made
+here is strictly a transport-layer one:
 
-Detection thresholds (conf=0.90, iou=0.5, imgsz=640), the tracker config,
-the classification pipeline, CLASSIFY_EVERY_N_FRAMES, LAST_N_FRAMES,
-GRADE_MAP, the counting/line-crossing logic, and determine_final_grade_v4
-are all 100% IDENTICAL to the original script. Nothing about detection,
-tracking, classification, or the final grade decision has been changed.
+    Qt version                         Streamlit version
+    ---------------------------------  ---------------------------------
+    QThread                            threading.Thread (stdlib)
+    Signal.emit(...)                   queue.Queue.put(...)
+    self._stop_requested flag          threading.Event
+    QImage conversion                  raw numpy array (st.image takes
+                                        arrays natively, no QImage needed)
+
+Detection thresholds, the tracker config, the classification pipeline,
+CLASSIFY_EVERY_N_FRAMES, LAST_N_FRAMES, GRADE_MAP, the counting /
+line-crossing logic, and determine_final_grade_v4 are 100% IDENTICAL to
+the original script. Nothing about detection, tracking, classification,
+or the final grade decision has been changed — only how results are
+delivered to the UI layer.
 """
 
 import time
+import threading
+import queue
+from collections import defaultdict
+
 import cv2
 import torch
 import timm
@@ -33,30 +39,22 @@ import torch.nn as nn
 import numpy as np
 from ultralytics import YOLO
 from torchvision import transforms
-from collections import defaultdict
 
-from PySide6.QtCore import QThread, Signal
-from PySide6.QtGui import QImage
-
-# ==========================
-# CONFIGURATION (UNCHANGED)
-# ==========================
-CLASSIFY_EVERY_N_FRAMES = 2
-GRADE_MAP = {0: "A", 1: "B", 2: "C"}
-LAST_N_FRAMES = 7
-
-# Model paths - identical values to the original script, simply hoisted to
-# module-level constants so the GUI's "System Information" panel can
-# display them. Edit these two lines if your model files move.
-YOLO_MODEL_PATH = r"C:\Users\FABRIKA\Documents\Sorting System\best.pt"
-CLASSIFICATION_MODEL_PATH = r"C:\Users\FABRIKA\Documents\Sorting System\best_orange_model.pth"
+from config import (
+    YOLO_MODEL_PATH, CLASSIFICATION_MODEL_PATH,
+    DETECTION_CONF, DETECTION_IOU, DETECTION_IMGSZ, TRACKER_CONFIG,
+    CLASSIFY_EVERY_N_FRAMES, LAST_N_FRAMES, GRADE_MAP,
+    CLASSIFICATION_MODEL_NAME, CLASSIFICATION_NUM_CLASSES, CLASSIFICATION_DROPOUT,
+    IMAGENET_MEAN, IMAGENET_STD,
+)
 
 
-# ==========================
+# ==========================================================================
 # CLASSIFICATION MODEL (UNCHANGED)
-# ==========================
+# ==========================================================================
 class OrangeClassifier(nn.Module):
-    def __init__(self, model_name="convnext_base.fb_in22k_ft_in1k", num_classes=3, dropout=0.35):
+    def __init__(self, model_name=CLASSIFICATION_MODEL_NAME,
+                 num_classes=CLASSIFICATION_NUM_CLASSES, dropout=CLASSIFICATION_DROPOUT):
         super().__init__()
         self.backbone = timm.create_model(model_name, pretrained=False, num_classes=0, global_pool="avg")
         in_features = self.backbone.num_features
@@ -81,6 +79,10 @@ def load_classification_model(model_path, device):
     return model
 
 
+def load_detection_model(model_path):
+    return YOLO(model_path)
+
+
 # ==========================
 # TRANSFORMS & CLASSIFICATION (UNCHANGED)
 # ==========================
@@ -88,7 +90,7 @@ transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
 ])
 
 
@@ -129,53 +131,65 @@ def determine_final_grade_v4(probs_history):
 
 
 # ==========================================================================
-# QTHREAD WRAPPER — GUI CONNECTION LAYER ONLY. NO AI LOGIC IS CHANGED BELOW.
+# STREAMLIT CONNECTION LAYER — threading.Thread + queue.Queue
+# (was QThread + Signal in the PySide6 version). No AI logic changed below.
 # ==========================================================================
-class VideoProcessorThread(QThread):
-    """Runs the exact original pipeline in a background thread and emits
-    Qt signals so the GUI can display live results. This class does not
-    alter detection, tracking, classification, or decision logic in any
-    way - it only removes the imshow/waitKey preview loop and hardcoded
-    video path, replacing them with signal emission and a constructor
-    argument, which is the minimum required to run this code behind a GUI
-    instead of a blocking OpenCV window."""
+class VideoProcessorWorker:
+    """Runs the exact original pipeline on a background thread and pushes
+    events onto a thread-safe queue so the Streamlit script (running on
+    the main thread) can poll them each rerun and update placeholders.
 
-    frame_ready = Signal(QImage)
-    stats_ready = Signal(int, int, int, int)       # total, A, B, C
-    fps_ready = Signal(float)
-    frame_index_ready = Signal(int, int)            # current_frame, total_frames
-    status_changed = Signal(str)                    # Ready / Running / Stopped / Finished
-    device_ready = Signal(str)
-    error_occurred = Signal(str)
-    finished_processing = Signal()
+    Event dicts on the queue look like:
+        {"type": "frame", "frame": <np.ndarray RGB>}
+        {"type": "stats", "total": int, "a": int, "b": int, "c": int}
+        {"type": "fps", "value": float}
+        {"type": "frame_index", "current": int, "total": int}
+        {"type": "status", "value": str}
+        {"type": "device", "value": str}
+        {"type": "error", "message": str}
+        {"type": "finished"}
+    """
 
-    def __init__(self, video_path, save_output=False, parent=None):
-        super().__init__(parent)
+    def __init__(self, video_path, save_output=False, event_queue=None):
         self.video_path = video_path
         self.save_output = save_output
-        self._stop_requested = False
+        self.queue = event_queue if event_queue is not None else queue.Queue()
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self._thread
 
     def stop(self):
-        self._stop_requested = True
+        self._stop_event.set()
 
-    def run(self):
+    def is_running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def _emit(self, event):
+        self.queue.put(event)
+
+    def _run(self):
         try:
             self._process()
         except Exception as exc:
-            self.error_occurred.emit(str(exc))
-            self.status_changed.emit("Stopped")
+            self._emit({"type": "error", "message": str(exc)})
+            self._emit({"type": "status", "value": "Stopped"})
 
     def _process(self):
         # ==========================
         # MAIN PIPELINE (UNCHANGED LOGIC)
         # ==========================
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device_ready.emit("GPU (CUDA)" if device.type == "cuda" else "CPU")
+        self._emit({"type": "device", "value": "GPU (CUDA)" if device.type == "cuda" else "CPU"})
 
-        self.status_changed.emit("Loading YOLO model...")
-        model_yolo = YOLO(YOLO_MODEL_PATH)
+        self._emit({"type": "status", "value": "Loading YOLO model..."})
+        model_yolo = load_detection_model(YOLO_MODEL_PATH)
 
-        self.status_changed.emit("Loading classification model...")
+        self._emit({"type": "status", "value": "Loading classification model..."})
         model_class = load_classification_model(CLASSIFICATION_MODEL_PATH, device)
 
         video_path = self.video_path
@@ -184,14 +198,14 @@ class VideoProcessorThread(QThread):
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()  # Close after extracting properties
+        cap.release()
 
         out = None
         if self.save_output:
             out = cv2.VideoWriter(
                 "orange_counter_output.mp4",
                 cv2.VideoWriter_fourcc(*'mp4v'),
-                fps,
+                fps if fps and fps > 0 else 25,
                 (width, height)
             )
 
@@ -211,23 +225,23 @@ class VideoProcessorThread(QThread):
 
         results = model_yolo.track(
             source=video_path,
-            tracker="bytetrack.yaml",
+            tracker=TRACKER_CONFIG,
             persist=True,
             stream=True,
-            conf=0.90,
-            iou=0.5,
-            imgsz=640,
+            conf=DETECTION_CONF,
+            iou=DETECTION_IOU,
+            imgsz=DETECTION_IMGSZ,
             verbose=False
         )
 
         frame_idx = 0
-        self.status_changed.emit("Running")
+        self._emit({"type": "status", "value": "Running"})
         last_fps_time = time.time()
         fps_frame_counter = 0
 
         for result in results:
-            if self._stop_requested:
-                self.status_changed.emit("Stopped")
+            if self._stop_event.is_set():
+                self._emit({"type": "status", "value": "Stopped"})
                 break
 
             frame = result.orig_img
@@ -283,7 +297,8 @@ class VideoProcessorThread(QThread):
                         elif final_grade == "C":
                             counter_C += 1
 
-                        self.stats_ready.emit(counter_total, counter_A, counter_B, counter_C)
+                        self._emit({"type": "stats", "total": counter_total,
+                                     "a": counter_A, "b": counter_B, "c": counter_C})
 
                     previous_y[track_id] = cy
 
@@ -299,36 +314,25 @@ class VideoProcessorThread(QThread):
             if out is not None:
                 out.write(frame)
 
-            # ---- GUI connection only: convert BGR frame to QImage & emit ----
+            # ---- Streamlit connection only: push RGB numpy frame to queue ----
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb_frame.shape
-            qimg = QImage(rgb_frame.data, w, h, ch * w, QImage.Format_RGB888).copy()
-            self.frame_ready.emit(qimg)
-            self.frame_index_ready.emit(frame_idx, total_frames)
+            self._emit({"type": "frame", "frame": rgb_frame})
+            self._emit({"type": "frame_index", "current": frame_idx, "total": total_frames})
 
             fps_frame_counter += 1
             now = time.time()
             if now - last_fps_time >= 0.5:
                 current_fps = fps_frame_counter / (now - last_fps_time)
-                self.fps_ready.emit(current_fps)
+                self._emit({"type": "fps", "value": current_fps})
                 fps_frame_counter = 0
                 last_fps_time = now
 
         if out is not None:
             out.release()
 
-        if not self._stop_requested:
-            self.status_changed.emit("Finished")
+        if not self._stop_event.is_set():
+            self._emit({"type": "status", "value": "Finished"})
 
-        self.stats_ready.emit(counter_total, counter_A, counter_B, counter_C)
-        self.finished_processing.emit()
-
-        # ==========================
-        # FINAL STATISTICS (still printed to console, same as original)
-        # ==========================
-        print("=" * 40)
-        print("TOTAL COUNT =", counter_total)
-        print("GRADE A =", counter_A)
-        print("GRADE B =", counter_B)
-        print("GRADE C =", counter_C)
-        print("=" * 40)
+        self._emit({"type": "stats", "total": counter_total,
+                     "a": counter_A, "b": counter_B, "c": counter_C})
+        self._emit({"type": "finished"})
